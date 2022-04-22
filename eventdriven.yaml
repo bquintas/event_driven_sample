@@ -1,0 +1,208 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+
+Resources:
+  ##Creates the bucket where the uploaded objects will land
+  s3uploadbucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "upload-${AWS::StackName}-${AWS::Region}-${AWS::AccountId}"
+
+  ##Creates the bucket where the unzipped objects will land
+  s3unzipbucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "unzip-${AWS::StackName}-${AWS::Region}-${AWS::AccountId}"
+
+  ##Creates a SQS queue for the unzip lambda to write messages after finishing the unzip
+  PostUnzipQueue:
+    Type: AWS::SQS::Queue
+
+  ##Gives S3 permission to invoke the unzip lambda after the putobject operation
+  AllowS3ToCallLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref UploadTriggerLambda
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt s3uploadbucket.Arn
+
+  ##lambda function that is triggered by the S3 put operation, includes policies needed to read/write from the 2 S3 buckets and write to the SQS queue.
+  ##The trigger is only valid for .zip files
+
+  UploadTriggerLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Lambda function to unzip uploaded file
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Timeout: 30
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - "s3:GetObject"
+              Resource:
+                - !Sub "arn:aws:s3:::upload-${AWS::StackName}-${AWS::Region}-${AWS::AccountId}*"
+            - Effect: Allow
+              Action:
+                - "s3:PutObject"
+              Resource:
+                - !Sub "arn:aws:s3:::unzip-${AWS::StackName}-${AWS::Region}-${AWS::AccountId}*"
+            - Effect: Allow
+              Action:
+                - "sqs:SendMessage"
+              Resource: !GetAtt PostUnzipQueue.Arn
+      Events:
+        S3:
+          Type: S3
+          Properties:
+            Bucket: !Ref s3uploadbucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .zip
+      Environment:
+        Variables:
+          SQS_URL: !Ref PostUnzipQueue
+          S3_TARGET_BUCKET: !Sub "unzip-${AWS::StackName}-${AWS::Region}-${AWS::AccountId}"
+      InlineCode: |
+        import json
+        import urllib.parse
+        import boto3
+        import zipfile
+        import io
+        import os
+        print('Loading function')
+
+        s3 = boto3.client('s3')
+        targetbucket = os.environ['S3_TARGET_BUCKET']
+
+
+        def lambda_handler(event, context):
+            print("Received event: " + json.dumps(event, indent=2))
+
+            # Get the object from the event and show its content type
+            bucket = event['Records'][0]['s3']['bucket']['name']
+            key = urllib.parse.unquote_plus(
+                event['Records'][0]['s3']['object']['key'], encoding='utf-8')
+            try:
+                obj = s3.get_object(Bucket=bucket, Key=key)
+                putObjects = []
+                with io.BytesIO(obj["Body"].read()) as tf:
+                    # rewind the file
+                    tf.seek(0)
+                    # Create Destination Prefix from filename (without input/ or trailing filetype)
+                    dest_prefix = ".".join(key.split(".")[:-1])
+                    #dest_prefix = "/".join(dest_prefix.split("/")[1:])
+                    # Read the file as a zipfile and process the members
+                    with zipfile.ZipFile(tf, mode='r') as zipf:
+                        for file in zipf.infolist():
+                            fileName = dest_prefix+'/'+file.filename
+                            putFile = s3.put_object(
+                                Bucket=targetbucket, Key=fileName, Body=zipf.read(file))
+                            putObjects.append(putFile)
+                            print(putFile)
+            except Exception as e:
+                print(e)
+                print('Error getting object {} from bucket {}. Make sure they exist and your bucket is in the same region as this function.'.format(key, bucket))
+                raise e
+            sqs = boto3.client('sqs')
+            response = sqs.send_message(
+                QueueUrl=os.environ['SQS_URL'],
+                MessageBody=json.dumps(dest_prefix),
+            )
+  ##Creates the DynamoDB Table with ProjectID as primary key
+  MetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: "ProjectId"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "ProjectId"
+          KeyType: "HASH"
+      BillingMode: PAY_PER_REQUEST
+
+  ##Lambda function that iterates through the prefix of the unzipped file and writes the objects to DDB
+
+  ReadObjectsWriteToDynamoLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Lambda function to unzip uploaded file
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Timeout: 30
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - "s3:GetObject"
+                - "s3:ListBucket"
+              Resource:
+                - !Sub "arn:aws:s3:::unzip-${AWS::StackName}-${AWS::Region}-${AWS::AccountId}*"
+            - Effect: Allow
+              Action:
+                - "sqs:SendMessage"
+                - "sqs:ReceiveMessage"
+                - "sqs:GetQueueAttributes"
+              Resource: !GetAtt PostUnzipQueue.Arn
+            - Effect: Allow
+              Action:
+                - "dynamodb:PutItem"
+                - "dynamodb:UpdateItem"
+              Resource: !GetAtt MetadataTable.Arn
+      Events:
+        SQS:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt PostUnzipQueue.Arn
+      Environment:
+        Variables:
+          DDB_TABLE: !Ref MetadataTable
+          SOURCE_BUCKET: !Sub "unzip-${AWS::StackName}-${AWS::Region}-${AWS::AccountId}"
+      InlineCode: |
+        import json
+        import boto3
+        import uuid
+        import typing
+        import os
+
+        s3 = boto3.resource('s3')
+        table_name = os.environ['DDB_TABLE']
+        my_bucket = s3.Bucket(os.environ['SOURCE_BUCKET'])
+
+
+        def lambda_handler(event, context):
+            prefix = event['Records'][0]['body']
+            s3location = 's3://'+os.environ['SOURCE_BUCKET']+'/'+prefix.strip('"')+'/'
+            print("Received event: " + json.dumps(event, indent=2))
+            list_of_objects = get_objects_from_s3(my_bucket, prefix.strip('"'))
+            create_project(prefix.strip('"'), s3location, list_of_objects)
+
+        def create_project(project_name, s3_location, s3_items):
+
+            s3_items = s3_items or []
+
+            table = boto3.resource("dynamodb").Table(table_name)
+            project_id = uuid.uuid4().hex
+
+            table.put_item(
+                Item={
+                    "ProjectId": project_id,
+                    "Project Name": project_name,
+                    "S3Location": s3_location,
+                    "Objects": s3_items
+                },)
+
+        def get_objects_from_s3(bucket, prefix):
+          items = []
+          for object_summary in bucket.objects.filter(Prefix=prefix):
+              items.append(object_summary.key)
+          return(items)
