@@ -28,7 +28,7 @@ Resources:
       SourceAccount: !Sub ${AWS::AccountId}
       SourceArn: !GetAtt s3uploadbucket.Arn
 
-  #Restrict lambda to account and queue after the putobject operation
+  #Restrict lambda to account and queue
   AllowSQSToCallLambdaPermission:
     Type: AWS::Lambda::Permission
     Properties:
