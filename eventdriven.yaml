@@ -18,13 +18,14 @@ Resources:
   PostUnzipQueue:
     Type: AWS::SQS::Queue
 
-  ##Gives S3 permission to invoke the unzip lambda after the putobject operation
+  #Restrict lambda to account and bucket after the putobject operation
   AllowS3ToCallLambdaPermission:
     Type: AWS::Lambda::Permission
     Properties:
       Action: "lambda:InvokeFunction"
       FunctionName: !Ref UploadTriggerLambda
       Principal: s3.amazonaws.com
+      SourceAccount: !Sub ${AWS::AccountId}
       SourceArn: !GetAtt s3uploadbucket.Arn
 
   ##lambda function that is triggered by the S3 put operation, includes policies needed to read/write from the 2 S3 buckets and write to the SQS queue.
