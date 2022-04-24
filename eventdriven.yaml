@@ -28,6 +28,15 @@ Resources:
       SourceAccount: !Sub ${AWS::AccountId}
       SourceArn: !GetAtt s3uploadbucket.Arn
 
+  #Restrict lambda to account and queue after the putobject operation
+  AllowSQSToCallLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref ReadObjectsWriteToDynamoLambda
+      Principal: sqs.amazonaws.com
+      SourceArn: !GetAtt PostUnzipQueue.Arn
+
   ##lambda function that is triggered by the S3 put operation, includes policies needed to read/write from the 2 S3 buckets and write to the SQS queue.
   ##The trigger is only valid for .zip files
 
